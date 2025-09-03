@@ -76,7 +76,8 @@ def main(_):
         json.dump(flag_dict, f)
 
     config = FLAGS.agent
-    
+    use_offline_data = config['agent_name'] != 'ppo'
+
     # data loading
     if FLAGS.ogbench_dataset_dir is not None:
         # custom ogbench dataset
@@ -135,14 +136,20 @@ def main(_):
 
         return ds
     
-    train_dataset = process_train_dataset(train_dataset)
-    example_batch = train_dataset.sample(())
-    
+    if use_offline_data:
+        train_dataset = process_train_dataset(train_dataset)
+        example_batch = train_dataset.sample(())
+        example_observations = example_batch['observations']
+        example_actions = example_batch['actions']
+    else:
+        example_observations, _ = env.reset()
+        example_actions = env.action_space.sample()
+
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
         FLAGS.seed,
-        example_batch['observations'],
-        example_batch['actions'],
+        example_observations,
+        example_actions,
         config,
     )
 
@@ -152,18 +159,31 @@ def main(_):
         prefixes.append("online_agent")
 
     logger = LoggingHelper(
-        csv_loggers={prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
+        csv_loggers={prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv"))
                     for prefix in prefixes},
         wandb_logger=wandb,
     )
 
     # transition from offline to online
-    replay_buffer = ReplayBuffer.create(example_batch, size=FLAGS.buffer_size)
-        
+    if use_offline_data:
+        replay_buffer = ReplayBuffer.create(example_batch, size=FLAGS.buffer_size)
+    else:
+        example_transition = dict(
+            observations=example_observations,
+            actions=example_actions,
+            rewards=np.array(0.0, dtype=np.float32),
+            terminals=np.array(0.0, dtype=np.float32),
+            masks=np.array(1.0, dtype=np.float32),
+            next_observations=example_observations,
+            log_probs=np.array(0.0, dtype=np.float32),
+        )
+        replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
+
     ob, _ = env.reset()
-    
+
     action_queue = []
-    action_dim = example_batch["actions"].shape[-1]
+    log_prob_queue = []
+    action_dim = example_actions.shape[-1]
 
     from collections import defaultdict
     data = defaultdict(list)
@@ -179,13 +199,28 @@ def main(_):
         if len(action_queue) == 0:
             if i <= FLAGS.start_training:
                 action = jax.random.uniform(key, shape=(action_dim,), minval=-1, maxval=1)
+                log_prob = 0.0
             else:
-                action = agent.sample_actions(observations=ob, rng=key)
+                if config['agent_name'] == 'ppo':
+                    action, log_prob = agent.sample_actions(observations=ob, rng=key, return_log_prob=True)
+                else:
+                    action = agent.sample_actions(observations=ob, rng=key)
+                    log_prob = None
 
             action_chunk = np.array(action).reshape(-1, action_dim)
-            for action in action_chunk:
-                action_queue.append(action)
+            if config['agent_name'] == 'ppo':
+                log_prob_chunk = np.array(log_prob).reshape(-1)
+                for a, lp in zip(action_chunk, log_prob_chunk):
+                    action_queue.append(a)
+                    log_prob_queue.append(lp)
+            else:
+                for a in action_chunk:
+                    action_queue.append(a)
         action = action_queue.pop(0)
+        if config['agent_name'] == 'ppo':
+            log_prob = log_prob_queue.pop(0)
+        else:
+            log_prob = None
         
         next_ob, int_reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
@@ -228,6 +263,8 @@ def main(_):
             masks=1.0 - terminated,
             next_observations=next_ob,
         )
+        if config['agent_name'] == 'ppo':
+            transition['log_probs'] = log_prob
         replay_buffer.add_transition(transition)
         
         # done
@@ -238,18 +275,23 @@ def main(_):
             ob = next_ob
 
         if i >= FLAGS.start_training:
-            dataset_batch = train_dataset.sample_sequence(config['batch_size'] // 2 * FLAGS.utd_ratio, 
-                        sequence_length=FLAGS.horizon_length, discount=discount)
-            replay_batch = replay_buffer.sample_sequence(FLAGS.utd_ratio * config['batch_size'] // 2, 
-                sequence_length=FLAGS.horizon_length, discount=discount)
-            
-            batch = {k: np.concatenate([
-                dataset_batch[k].reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + dataset_batch[k].shape[1:]), 
-                replay_batch[k].reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + replay_batch[k].shape[1:])], axis=1) for k in dataset_batch}
-            # batch = jax.tree.map(lambda x: x.reshape((
-            #     FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
+            if config['agent_name'] == 'ppo':
+                for _ in range(FLAGS.utd_ratio):
+                    batch = replay_buffer.sample(config['batch_size'])
+                    agent, update_info['online_agent'] = agent.update(batch)
+            else:
+                dataset_batch = train_dataset.sample_sequence(config['batch_size'] // 2 * FLAGS.utd_ratio,
+                            sequence_length=FLAGS.horizon_length, discount=discount)
+                replay_batch = replay_buffer.sample_sequence(FLAGS.utd_ratio * config['batch_size'] // 2,
+                    sequence_length=FLAGS.horizon_length, discount=discount)
 
-            agent, update_info["online_agent"] = agent.batch_update(batch)
+                batch = {k: np.concatenate([
+                    dataset_batch[k].reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + dataset_batch[k].shape[1:]),
+                    replay_batch[k].reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + replay_batch[k].shape[1:])], axis=1) for k in dataset_batch}
+                # batch = jax.tree.map(lambda x: x.reshape((
+                #     FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
+
+                agent, update_info["online_agent"] = agent.batch_update(batch)
             
         if i % FLAGS.log_interval == 0:
             for key, info in update_info.items():
@@ -271,7 +313,7 @@ def main(_):
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, log_step)
 
-        if FLAGS.ogbench_dataset_dir is not None and FLAGS.dataset_replace_interval != 0 and i % FLAGS.dataset_replace_interval == 0:
+        if use_offline_data and FLAGS.ogbench_dataset_dir is not None and FLAGS.dataset_replace_interval != 0 and i % FLAGS.dataset_replace_interval == 0:
             dataset_idx = (dataset_idx + 1) % len(dataset_paths)
             print(f"Using new dataset: {dataset_paths[dataset_idx]}", flush=True)
             train_dataset, val_dataset = make_ogbench_env_and_datasets(

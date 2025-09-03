@@ -78,14 +78,14 @@ class PPOAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @partial(jax.jit, static_argnames=('return_log_prob',))
-    def sample_actions(self, observations, seed=None, temperature=1.0, return_log_prob=False):
+    def sample_actions(self, observations, rng=None, temperature=1.0, return_log_prob=False):
         dist = self.network.select('actor')(observations, temperature=temperature)
         if return_log_prob:
-            actions, log_prob = dist.sample_and_log_prob(seed=seed)
+            actions, log_prob = dist.sample_and_log_prob(seed=rng)
             actions = jnp.clip(actions, -1, 1)
             return actions, log_prob
         else:
-            actions = dist.sample(seed=seed)
+            actions = dist.sample(seed=rng)
             actions = jnp.clip(actions, -1, 1)
             return actions
 
