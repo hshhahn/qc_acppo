@@ -8,58 +8,31 @@ from envs.ogbench_utils import make_ogbench_env_and_datasets
 from envs.robomimic_utils import is_robomimic_env
 
 from utils.flax_utils import save_agent
-from utils.datasets import Dataset
-import numpy as np
-
-
-class RolloutBuffer(Dataset):
-    """A simple rollout storage for on-policy data."""
-
-    @classmethod
-    def create(cls, transition, size):
-        def create_buffer(example):
-            example = np.array(example)
-            return np.zeros((size, *example.shape), dtype=example.dtype)
-
-        buffer_dict = jax.tree_util.tree_map(create_buffer, transition)
-        dataset = cls(buffer_dict)
-        dataset.max_size = size
-        dataset.size = 0
-        dataset.pointer = 0
-        return dataset
-
-    def add_transition(self, transition):
-        def set_idx(buffer, new_element):
-            buffer[self.pointer] = new_element
-
-        jax.tree_util.tree_map(set_idx, self._dict, transition)
-        self.pointer = (self.pointer + 1) % self.max_size
-        self.size = min(self.max_size, self.size + 1)
-
-    def clear(self):
-        self.size = self.pointer = 0
+from utils.datasets import Dataset, ReplayBuffer
 
 from evaluation import evaluate
 from agents import agents
-
-if 'CUDA_VISIBLE_DEVICES' in os.environ:
-    os.environ['EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
-    os.environ['MUJOCO_EGL_DEVICE_ID'] = os.environ['CUDA_VISIBLE_DEVICES']
+import numpy as np
 
 
 FLAGS = flags.FLAGS
 
+if "CUDA_VISIBLE_DEVICES" in os.environ:
+    os.environ["EGL_DEVICE_ID"] = os.environ["CUDA_VISIBLE_DEVICES"]
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = os.environ["CUDA_VISIBLE_DEVICES"]
+
+# ---- Core run/setup flags ----
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
-flags.DEFINE_integer('rollout_size', 2048, 'Rollout storage size.')
+flags.DEFINE_integer('buffer_size', 1000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
-flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
+flags.DEFINE_integer('eval_interval', 1000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', -1, 'Save interval.')
-flags.DEFINE_integer('start_training', 5000, 'when does training start')
+flags.DEFINE_integer('start_training', 0, 'when does training start')
 
 flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
 
@@ -69,6 +42,7 @@ flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
 flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 
+# NOTE: pass --agent=agents/ppo.py on CLI to switch to PPO
 config_flags.DEFINE_config_file('agent', 'agents/acrlpd.py', lock_config=False)
 
 flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use")
@@ -80,6 +54,7 @@ flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
 
+
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
         self.csv_loggers = csv_loggers
@@ -90,12 +65,23 @@ class LoggingHelper:
     def log(self, data, prefix, step):
         assert prefix in self.csv_loggers, prefix
         self.csv_loggers[prefix].log(data, step=step)
-        self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
+        self.wandb_logger.log({f"{prefix}/{k}": float(v) for k, v in data.items()}, step=step)
+
+
+def _process_reward(env_name: str, r: float) -> float:
+    if "antmaze" in env_name and (
+        "diverse" in env_name or "play" in env_name or "umaze" in env_name
+    ):
+        return r - 1.0
+    if is_robomimic_env(env_name):
+        return r - 1.0
+    return r
+
 
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
-    run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
-    
+    run = setup_wandb(project="qc", group=FLAGS.run_group, name=exp_name)
+
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
@@ -103,206 +89,134 @@ def main(_):
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f)
 
-    config = FLAGS.agent
-    
-    # data loading
-    if FLAGS.ogbench_dataset_dir is not None:
-        # custom ogbench dataset
-        assert FLAGS.dataset_replace_interval != 0
-        assert FLAGS.dataset_proportion == 1.0
-        dataset_idx = 0
-        dataset_paths = [
-            file for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz")) if '-val.npz' not in file
-        ]
-        env, eval_env, train_dataset, val_dataset = make_ogbench_env_and_datasets(
-            FLAGS.env_name,
-            dataset_path=dataset_paths[dataset_idx],
-            compact_dataset=False,
-        )
-    else:
-        env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
+    # ---- Env setup ----
+    env, eval_env, _, _ = make_env_and_datasets(FLAGS.env_name)
 
-    # house keeping
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
+    rng = jax.random.PRNGKey(FLAGS.seed)
 
-    online_rng, rng = jax.random.split(jax.random.PRNGKey(FLAGS.seed), 2)
-    log_step = 0
-    
-    discount = FLAGS.discount
-    config["horizon_length"] = FLAGS.horizon_length
+    # Example batch for network init
+    example_observations, _ = env.reset()
+    example_actions = env.action_space.sample()
 
-    # handle dataset
-    def process_train_dataset(ds):
-        """
-        Process the train dataset to 
-            - handle dataset proportion
-            - handle sparse reward
-            - convert to action chunked dataset
-        """
+    # ---- Agent setup ----
+    config = FLAGS.agent
+    agent_class = agents[config["agent_name"]]
+    agent = agent_class.create(FLAGS.seed, example_observations, example_actions, config)
 
-        ds = Dataset.create(**ds)
-        if FLAGS.dataset_proportion < 1.0:
-            new_size = int(len(ds['masks']) * FLAGS.dataset_proportion)
-            ds = Dataset.create(
-                **{k: v[:new_size] for k, v in ds.items()}
-            )
-        
-        if is_robomimic_env(FLAGS.env_name):
-            penalty_rewards = ds["rewards"] - 1.0
-            ds_dict = {k: v for k, v in ds.items()}
-            ds_dict["rewards"] = penalty_rewards
-            ds = Dataset.create(**ds_dict)
-        
-        if FLAGS.sparse:
-            # Create a new dataset with modified rewards instead of trying to modify the frozen one
-            sparse_rewards = (ds["rewards"] != 0.0) * -1.0
-            ds_dict = {k: v for k, v in ds.items()}
-            ds_dict["rewards"] = sparse_rewards
-            ds = Dataset.create(**ds_dict)
-
-        return ds
-    
-    train_dataset = process_train_dataset(train_dataset)
-    example_batch = train_dataset.sample(())
-    
-    agent_class = agents[config['agent_name']]
-    agent = agent_class.create(
-        FLAGS.seed,
-        example_batch['observations'],
-        example_batch['actions'],
-        config,
-    )
-
-    # Setup logging.
-    prefixes = ["eval", "env"]
-    if FLAGS.online_steps > 0:
-        prefixes.append("online_agent")
-
+    # ---- Logging ----
+    prefixes = ["train", "eval", "env"]
     logger = LoggingHelper(
-        csv_loggers={prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) 
-                    for prefix in prefixes},
-        wandb_logger=wandb,
+        csv_loggers={
+            prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv"))
+            for prefix in prefixes
+        },
+        wandb_logger=__import__("wandb"),
     )
 
-    # transition from offline to online
-    example_transition = dict(example_batch)
-    example_transition['log_probs'] = np.zeros_like(example_batch['rewards'])
-    rollout_buffer = RolloutBuffer.create(example_transition, size=FLAGS.rollout_size)
+    obs, _ = env.reset()
+    global_step = 0
+    action_dim = example_actions.shape[-1]
 
-    ob, _ = env.reset()
+    pbar = tqdm.tqdm(total=FLAGS.online_steps, desc="PPO")
 
-    action_queue = []
-    log_prob_queue = []
-    action_dim = example_batch["actions"].shape[-1]
+    # ----- Simple on-policy rollout buffer (PPO only) -----
+    is_ppo = (config['agent_name'] == 'ppo')
+    ppo_rollout = {
+        'observations': [],
+        'actions': [],
+        'rewards': [],
+        'dones': [],
+        'old_log_prob': [],
+    }
 
-    from collections import defaultdict
-    data = defaultdict(list)
-    online_init_time = time.time()
+    def maybe_ppo_update(next_obs, done_flag):
+        nonlocal agent
+        if not is_ppo:
+            return
+        # trigger when we have enough steps or at episode end if buffer is big
+        if len(ppo_rollout['rewards']) == 0:
+            return
+        reached_batch = len(ppo_rollout['rewards']) >= int(config['batch_size'])
+        if (not reached_batch) and (not done_flag):
+            return
+        # use 0 bootstrap if terminal, else V(s_T)
+        last_v = float(agent.value(next_obs)) if not done_flag else 0.0
+        batch = {
+            'observations': np.asarray(ppo_rollout['observations'], dtype=np.float32),
+            'actions': np.asarray(ppo_rollout['actions'], dtype=np.float32),
+            'rewards': np.asarray(ppo_rollout['rewards'], dtype=np.float32),
+            'dones': np.asarray(ppo_rollout['dones'], dtype=np.float32),
+            'old_log_prob': np.asarray(ppo_rollout['old_log_prob'], dtype=np.float32),
+            'last_value': np.asarray(last_v, dtype=np.float32),
+        }
+        agent, train_info = agent.update(batch)
+        logger.log(train_info, "train", step=global_step)
+        # clear buffer
+        for k in ppo_rollout.keys():
+            ppo_rollout[k] = []
 
-    # Online RL
-    update_info = {}
-    for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
-        log_step += 1
-        online_rng, key = jax.random.split(online_rng)
+    while global_step < FLAGS.online_steps:
+        rng, key = jax.random.split(rng)
+        prev_obs = obs
 
-        if i == FLAGS.start_training:
-            rollout_buffer.clear()
-        
-        # during online rl, the action chunk is executed fully
-        if len(action_queue) == 0:
-            if i <= FLAGS.start_training:
-                action = jax.random.uniform(key, shape=(action_dim,), minval=-1, maxval=1)
-                log_prob = np.zeros(())
-            else:
-                action, log_prob = agent.sample_actions(observations=ob, rng=key, return_log_prob=True)
-
-            action_chunk = np.array(action).reshape(-1, action_dim)
-            log_prob_chunk = np.array(log_prob).reshape(-1)
-            for a, lp in zip(action_chunk, log_prob_chunk):
-                action_queue.append(a)
-                log_prob_queue.append(lp)
-        action = action_queue.pop(0)
-        cur_log_prob = log_prob_queue.pop(0)
-        
-        next_ob, int_reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
-        
-        if FLAGS.save_all_online_states:
-            state = env.get_state()
-            data["steps"].append(i)
-            data["obs"].append(np.copy(next_ob))
-            data["qpos"].append(np.copy(state["qpos"]))
-            data["qvel"].append(np.copy(state["qvel"]))
-            if "button_states" in state:
-                data["button_states"].append(np.copy(state["button_states"]))
-
-        # logging useful metrics from info dict
-        env_info = {}
-        for key, value in info.items():
-            if key.startswith("distance"):
-                env_info[key] = value
-        # always log this at every step
-        logger.log(env_info, "env", step=log_step)
-
-        if 'antmaze' in FLAGS.env_name and (
-            'diverse' in FLAGS.env_name or 'play' in FLAGS.env_name or 'umaze' in FLAGS.env_name
-        ):
-            # Adjust reward for D4RL antmaze.
-            int_reward = int_reward - 1.0
-        elif is_robomimic_env(FLAGS.env_name):
-            # Adjust online (0, 1) reward for robomimic
-            int_reward = int_reward - 1.0
-
-        if FLAGS.sparse:
-            assert int_reward <= 0.0
-            int_reward = (int_reward != 0.0) * -1.0
-
-        transition = dict(
-            observations=ob,
-            actions=action,
-            rewards=int_reward,
-            terminals=float(done),
-            masks=1.0 - terminated,
-            next_observations=next_ob,
-            log_probs=cur_log_prob,
-        )
-        rollout_buffer.add_transition(transition)
-        
-        # done
-        if done:
-            ob, _ = env.reset()
-            action_queue = []  # reset the action queue
-            log_prob_queue = []
+        if global_step < FLAGS.start_training:
+            # warmup random policy
+            action = jax.random.uniform(key, shape=(action_dim,), minval=-1, maxval=1)
+            log_prob = 0.0
         else:
-            ob = next_ob
+            if is_ppo:
+                action, log_prob = agent.sample_actions(prev_obs, rng=key, return_log_prob=True)
+            else:
+                action = agent.sample_actions(prev_obs, rng=key)
+                log_prob = None
+        action = np.asarray(action)
 
-        if i >= FLAGS.start_training and rollout_buffer.size >= FLAGS.utd_ratio * config['batch_size'] // 2:
-            dataset_batch = train_dataset.sample_sequence(config['batch_size'] // 2 * FLAGS.utd_ratio,
-                        sequence_length=FLAGS.horizon_length, discount=discount)
-            rollout_batch = rollout_buffer.sample_sequence(FLAGS.utd_ratio * config['batch_size'] // 2,
-                sequence_length=FLAGS.horizon_length, discount=discount)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = bool(terminated or truncated)
 
-            offline_log_prob = agent.network.select('actor')(dataset_batch['observations']).log_prob(dataset_batch['actions'])
-            offline_log_prob = np.array(offline_log_prob)
+        # env metrics
+        env_info = {k: v for k, v in info.items() if k.startswith("distance")}
+        if env_info:
+            logger.log(env_info, "env", step=global_step)
 
-            batch = {k: np.concatenate([
-                dataset_batch[k].reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + dataset_batch[k].shape[1:]),
-                rollout_batch[k].reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + rollout_batch[k].shape[1:])], axis=1) for k in dataset_batch}
+        # reward shaping for specific envs
+        reward = _process_reward(FLAGS.env_name, float(reward))
 
-            rollout_log_prob = rollout_batch['log_probs'].reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + rollout_batch['log_probs'].shape[1:])
-            offline_log_prob = offline_log_prob.reshape((FLAGS.utd_ratio, config["batch_size"] // 2) + offline_log_prob.shape[1:])
-            batch['log_probs'] = np.concatenate([offline_log_prob, rollout_log_prob], axis=1)
+        # ---- PPO rollout collection ----
+        if is_ppo:
+            ppo_rollout['observations'].append(np.asarray(prev_obs, dtype=np.float32))
+            ppo_rollout['actions'].append(np.asarray(action, dtype=np.float32))
+            ppo_rollout['rewards'].append(np.asarray(reward, dtype=np.float32))
+            ppo_rollout['dones'].append(np.asarray(float(done), dtype=np.float32))
+            ppo_rollout['old_log_prob'].append(np.asarray(log_prob if log_prob is not None else 0.0, dtype=np.float32))
 
-            agent, update_info["online_agent"] = agent.batch_update(batch)
-            rollout_buffer.clear()
-            
-        if i % FLAGS.log_interval == 0:
-            for key, info in update_info.items():
-                logger.log(info, key, step=log_step)
-            update_info = {}
+        # ---- ACRLPD style per-step update (non-PPO) ----
+        if (not is_ppo) and (global_step >= FLAGS.start_training):
+            batch = {
+                'observations': prev_obs,
+                'actions': action,
+                'rewards': reward,
+                'masks': 1.0 - float(terminated),
+                'next_observations': next_obs,
+                'log_probs': log_prob if log_prob is not None else 0.0,
+            }
+            agent, train_info = agent.update(batch)
+            logger.log(train_info, "train", step=global_step)
 
-        if (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
+        global_step += 1
+        pbar.update(1)
+
+        # trigger PPO update if ready *before* resetting obs
+        if is_ppo and (global_step >= FLAGS.start_training):
+            maybe_ppo_update(next_obs, done)
+
+        # step obs
+        obs = next_obs if not done else env.reset()[0]
+
+        # --- Eval & save ---
+        if FLAGS.eval_interval > 0 and global_step % FLAGS.eval_interval == 0:
             eval_info, _, _ = evaluate(
                 agent=agent,
                 env=eval_env,
@@ -311,43 +225,17 @@ def main(_):
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
             )
-            logger.log(eval_info, "eval", step=log_step)
+            logger.log(eval_info, "eval", step=global_step)
 
-        # saving
-        if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
-            save_agent(agent, FLAGS.save_dir, log_step)
-
-        if FLAGS.ogbench_dataset_dir is not None and FLAGS.dataset_replace_interval != 0 and i % FLAGS.dataset_replace_interval == 0:
-            dataset_idx = (dataset_idx + 1) % len(dataset_paths)
-            print(f"Using new dataset: {dataset_paths[dataset_idx]}", flush=True)
-            train_dataset, val_dataset = make_ogbench_env_and_datasets(
-                FLAGS.env_name,
-                dataset_path=dataset_paths[dataset_idx],
-                compact_dataset=False,
-                dataset_only=True,
-                cur_env=env,
-            )
-            train_dataset = process_train_dataset(train_dataset)
-
+        if FLAGS.save_interval > 0 and global_step % FLAGS.save_interval == 0:
+            save_agent(agent, FLAGS.save_dir, global_step)
 
     for key, csv_logger in logger.csv_loggers.items():
         csv_logger.close()
 
-    end_time = time.time()
-
-    if FLAGS.save_all_online_states:
-        c_data = {"steps": np.array(data["steps"]),
-                 "qpos": np.stack(data["qpos"], axis=0), 
-                 "qvel": np.stack(data["qpos"], axis=0), 
-                 "obs": np.stack(data["obs"], axis=0), 
-                 "online_time": end_time - online_init_time,
-        }
-        if len(data["button_states"]) != 0:
-            c_data["button_states"] = np.stack(data["button_states"], axis=0)
-        np.savez(os.path.join(FLAGS.save_dir, "data.npz"), **c_data)
-
-    with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
+    with open(os.path.join(FLAGS.save_dir, "token.tk"), "w") as f:
         f.write(run.url)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app.run(main)
