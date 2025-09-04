@@ -31,7 +31,7 @@ flags.DEFINE_integer('buffer_size', 1000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', -1, 'Save interval.')
-flags.DEFINE_integer('start_training', 5000, 'when does training start')
+flags.DEFINE_integer('start_training', 0, 'when does training start')
 
 flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
 
@@ -181,6 +181,7 @@ def main(_):
 
     ob, _ = env.reset()
 
+
     action_queue = []
     log_prob_queue = []
     action_dim = example_actions.shape[-1]
@@ -194,7 +195,8 @@ def main(_):
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
         online_rng, key = jax.random.split(online_rng)
-        
+        assert np.all(np.isfinite(ob)), ob
+
         # during online rl, the action chunk is executed fully
         if len(action_queue) == 0:
             if i <= FLAGS.start_training:
@@ -203,6 +205,7 @@ def main(_):
             else:
                 if config['agent_name'] == 'ppo':
                     action, log_prob = agent.sample_actions(observations=ob, rng=key, return_log_prob=True)
+
                 else:
                     action = agent.sample_actions(observations=ob, rng=key)
                     log_prob = None
@@ -217,11 +220,13 @@ def main(_):
                 for a in action_chunk:
                     action_queue.append(a)
         action = action_queue.pop(0)
+
         if config['agent_name'] == 'ppo':
             log_prob = log_prob_queue.pop(0)
         else:
             log_prob = None
-        
+        assert np.all(np.isfinite(action)), action
+
         next_ob, int_reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         

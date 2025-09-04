@@ -17,29 +17,30 @@ class PPOAgent(flax.struct.PyTreeNode):
     rng: Any
     network: Any
     config: Any = nonpytree_field()
+    EPS = 1e-6
 
     def loss(self, batch, grad_params, rng):
         """Compute the PPO loss."""
         dist = self.network.select('actor')(batch['observations'], params=grad_params)
-        log_prob = dist.log_prob(batch['actions'])
+        safe_actions = jnp.clip(batch['actions'], -1 + self.EPS, 1 - self.EPS)
+        log_prob = dist.log_prob(safe_actions)
         entropy = -dist.log_prob(dist.sample(seed=rng)).mean()
 
         value = self.network.select('value')(batch['observations'], params=grad_params)
         next_value = self.network.select('value')(batch['next_observations'], params=grad_params)
-
-        target = batch['rewards'] + self.config['discount'] * batch['masks'] * next_value
-        advantage = target - value
+        
+        target = jax.lax.stop_gradient(batch['rewards'] + self.config['discount'] * batch['masks'] * next_value)
+        advantage = target - jax.lax.stop_gradient(value)
+        # target = batch['rewards'] + self.config['discount'] * batch['masks'] * next_value
+        # advantage = target - value
         if self.config['normalize_advantage']:
             adv_mean = jnp.mean(advantage)
             adv_std = jnp.std(advantage) + 1e-8
             advantage = (advantage - adv_mean) / adv_std
 
-        # If the batch does not contain behavior-policy log-probabilities
-        # (e.g., validation batches sampled from an offline dataset), fall back
-        # to the current policy's log-probs so the importance-sampling ratio
-        # becomes 1.0.
         old_log_prob = batch.get('log_probs', log_prob)
-        ratio = jnp.exp(log_prob - old_log_prob)
+        log_ratio = jnp.clip(log_prob - old_log_prob, -20.0, 20.0)
+        ratio = jnp.exp(log_ratio)
         clipped_ratio = jnp.clip(ratio, 1.0 - self.config['clip_eps'], 1.0 + self.config['clip_eps'])
         actor_loss = -(jnp.minimum(ratio * advantage, clipped_ratio * advantage)).mean()
 
@@ -82,11 +83,9 @@ class PPOAgent(flax.struct.PyTreeNode):
         dist = self.network.select('actor')(observations, temperature=temperature)
         if return_log_prob:
             actions, log_prob = dist.sample_and_log_prob(seed=rng)
-            actions = jnp.clip(actions, -1, 1)
             return actions, log_prob
         else:
             actions = dist.sample(seed=rng)
-            actions = jnp.clip(actions, -1, 1)
             return actions
 
     @classmethod
